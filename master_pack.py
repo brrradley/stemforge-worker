@@ -4,7 +4,7 @@ import os
 import re
 import shutil
 import subprocess
-import tarfile
+import zipfile
 from pathlib import Path
 
 
@@ -28,6 +28,48 @@ def ffmpeg_to_flac(src: Path, dest: Path) -> None:
     run(["ffmpeg", "-y", "-i", src, "-c:a", "flac", dest])
 
 
+def write_litelabs_readme(path: Path, track: str) -> None:
+    path.write_text(
+        f"LiteLABS by LiteRECORDS\n\n"
+        f"Track: {track}\n\n"
+        "Created by LiteRECORDS\n"
+        "https://literecords.com\n\n"
+        "This stem pack was generated using LiteLABS, an experimental music tool created by "
+        "LiteRECORDS to support musicians, producers, remixers, DJs, and learners. LiteLABS "
+        "is designed for educational, creative, and restoration purposes, helping users study "
+        "arrangements, practise production techniques, prepare remix ideas, and better understand "
+        "how tracks are built.\n\n"
+        "This service is not intended to support piracy, unauthorised redistribution, or misuse "
+        "of copyrighted material. Please only process music that you own, control, have permission "
+        "to use, or are legally allowed to study or transform. LiteRECORDS is committed to supporting "
+        "musicians and encouraging responsible, creative use of music technology.\n\n"
+        "Included stems:\n\n"
+        "01 Vocals\n"
+        "02 Drums\n"
+        "03 Bass\n"
+        "04 Guitar\n"
+        "05 Piano / Keys\n"
+        "06 Synths / Strings / Other\n"
+        "07 Clean Instrumental\n\n"
+        "Generated with care by LiteLABS.\n",
+        encoding="utf-8",
+    )
+
+
+def make_zip_archive(source_dir: Path, archive: Path, archive_root: str) -> None:
+    print(f"Creating LiteLABS archive: {archive}", flush=True)
+    if archive.exists():
+        archive.unlink()
+
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as zip_file:
+        for path in sorted(source_dir.rglob("*")):
+            if path.is_file():
+                zip_file.write(path, arcname=str(Path(archive_root) / path.relative_to(source_dir)))
+
+    size_mb = archive.stat().st_size / (1024 * 1024)
+    print(f"LiteLABS archive created: {archive} ({size_mb:.2f} MB)", flush=True)
+
+
 def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, output_root: Path) -> dict:
     input_audio = input_audio.resolve()
     work_root = work_root.resolve()
@@ -44,7 +86,7 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     bs_out = job_root / "bs_roformer_sw"
     dem_out = job_root / "demucs6s"
     dem_stems = dem_out / "htdemucs_6s" / track
-    master = output_root / f"master_pack_{track}"
+    master = output_root / f"{track}-litelabs-stem-pack"
 
     for folder in (song_dir, bs_out, dem_out, master):
         folder.mkdir(parents=True, exist_ok=True)
@@ -82,12 +124,12 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     }.items():
         require_file(path, label)
 
-    ffmpeg_to_flac(bs_vocals, master / f"01_{track}_vocals_bs_roformer_sw.flac")
-    ffmpeg_to_flac(bs_drums, master / f"02_{track}_drums_bs_roformer_sw.flac")
-    shutil.copy2(dem_stems / "bass.flac", master / f"03_{track}_bass_htdemucs_6s.flac")
-    ffmpeg_to_flac(bs_guitar, master / f"04_{track}_guitar_bs_roformer_sw.flac")
-    ffmpeg_to_flac(bs_piano, master / f"05_{track}_piano_keys_bs_roformer_sw.flac")
-    ffmpeg_to_flac(bs_other, master / f"06_{track}_synth_strings_other_bs_roformer_sw.flac")
+    ffmpeg_to_flac(bs_vocals, master / f"01_{track}_vocals.flac")
+    ffmpeg_to_flac(bs_drums, master / f"02_{track}_drums.flac")
+    shutil.copy2(dem_stems / "bass.flac", master / f"03_{track}_bass.flac")
+    ffmpeg_to_flac(bs_guitar, master / f"04_{track}_guitar.flac")
+    ffmpeg_to_flac(bs_piano, master / f"05_{track}_piano_keys.flac")
+    ffmpeg_to_flac(bs_other, master / f"06_{track}_synth_strings_other.flac")
 
     run([
         "ffmpeg", "-y",
@@ -98,19 +140,13 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
         "-i", dem_stems / "other.flac",
         "-filter_complex", "amix=inputs=5:duration=longest:normalize=0",
         "-c:a", "flac",
-        master / f"07_{track}_instrumental_clean_htdemucs_6s.flac",
+        master / f"07_{track}_instrumental_clean.flac",
     ])
 
-    (master / "README.txt").write_text(
-        f"LiteLABS by LiteRECORDS\n\nTrack: {track}\n\nCreated by LiteRECORDS\nhttps://literecords.com\n",
-        encoding="utf-8",
-    )
+    write_litelabs_readme(master / "README.txt", track)
 
-    archive = output_root / f"{track}_master_pack.tar.gz"
-    if archive.exists():
-        archive.unlink()
-    with tarfile.open(archive, "w:gz") as tar:
-        tar.add(master, arcname=master.name)
+    archive = output_root / f"{track}-litelabs-stem-pack.zip"
+    make_zip_archive(master, archive, master.name)
 
     return {
         "track": track,
