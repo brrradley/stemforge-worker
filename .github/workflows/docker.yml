@@ -11,7 +11,7 @@ permissions:
   packages: write
 
 env:
-  IMAGE_NAME: stemforge-worker
+  IMAGE_NAME: litelabs-worker
 
 jobs:
   build:
