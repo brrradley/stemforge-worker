@@ -102,14 +102,7 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     ])
 
     (master / "README.txt").write_text(
-        f"LiteRECORDS StemForge master pack\n\nTrack: {track}\n\n"
-        "01 vocals: BS-RoFormer-SW\n"
-        "02 drums: BS-RoFormer-SW\n"
-        "03 bass: htdemucs_6s\n"
-        "04 guitar: BS-RoFormer-SW\n"
-        "05 piano_keys: BS-RoFormer-SW\n"
-        "06 synth_strings_other: BS-RoFormer-SW other\n"
-        "07 instrumental_clean: htdemucs_6s non-vocal stems\n",
+        f"LiteLABS by LiteRECORDS\n\nTrack: {track}\n\nCreated by LiteRECORDS\nhttps://literecords.com\n",
         encoding="utf-8",
     )
 
