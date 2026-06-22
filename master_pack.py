@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import zipfile
 from pathlib import Path
+from typing import Callable
+
+ProgressCallback = Callable[[str, int], None]
 
 
 def safe_track_name(filename: str) -> str:
@@ -17,6 +20,12 @@ def safe_track_name(filename: str) -> str:
 def run(cmd: list[str | Path]) -> None:
     print("\nRUN:", " ".join(str(x) for x in cmd), flush=True)
     subprocess.run([str(x) for x in cmd], check=True)
+
+
+def notify(progress: ProgressCallback | None, message: str, percent: int) -> None:
+    print(f"LiteLABS progress {percent}%: {message}", flush=True)
+    if progress:
+        progress(message, percent)
 
 
 def require_file(path: Path, label: str) -> None:
@@ -56,8 +65,8 @@ def write_litelabs_readme(path: Path, track: str) -> None:
     )
 
 
-def make_zip_archive(source_dir: Path, archive: Path, archive_root: str) -> None:
-    print(f"Creating LiteLABS archive: {archive}", flush=True)
+def make_zip_archive(source_dir: Path, archive: Path, archive_root: str, progress: ProgressCallback | None = None) -> None:
+    notify(progress, "Creating ZIP stem pack", 88)
     if archive.exists():
         archive.unlink()
 
@@ -68,14 +77,16 @@ def make_zip_archive(source_dir: Path, archive: Path, archive_root: str) -> None
 
     size_mb = archive.stat().st_size / (1024 * 1024)
     print(f"LiteLABS archive created: {archive} ({size_mb:.2f} MB)", flush=True)
+    notify(progress, "ZIP stem pack ready", 92)
 
 
-def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, output_root: Path) -> dict:
+def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, output_root: Path, progress: ProgressCallback | None = None) -> dict:
     input_audio = input_audio.resolve()
     work_root = work_root.resolve()
     model_dir = model_dir.resolve()
     output_root = output_root.resolve()
 
+    notify(progress, "Checking worker files", 18)
     require_file(input_audio, "input audio")
     require_file(model_dir / "BS-Roformer-SW.ckpt", "BS-RoFormer-SW checkpoint")
     require_file(model_dir / "BS-Roformer-SW.yaml", "BS-RoFormer-SW config")
@@ -91,9 +102,11 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     for folder in (song_dir, bs_out, dem_out, master):
         folder.mkdir(parents=True, exist_ok=True)
 
+    notify(progress, "Preparing audio", 22)
     wav_file = song_dir / f"{track}.wav"
     run(["ffmpeg", "-y", "-i", input_audio, wav_file])
 
+    notify(progress, "Separating main stems", 30)
     run([
         "bs-roformer-infer",
         "--config_path", model_dir / "BS-Roformer-SW.yaml",
@@ -102,6 +115,7 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
         "--store_dir", bs_out,
     ])
 
+    notify(progress, "Separating supporting stems", 52)
     run(["demucs", "-n", "htdemucs_6s", "-d", "cuda", "--flac", "-o", dem_out, wav_file])
 
     bs_vocals = bs_out / f"{track}_vocals.wav"
@@ -110,6 +124,7 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     bs_piano = bs_out / f"{track}_piano.wav"
     bs_other = bs_out / f"{track}_other.wav"
 
+    notify(progress, "Checking generated stems", 66)
     for label, path in {
         "BS vocals": bs_vocals,
         "BS drums": bs_drums,
@@ -124,13 +139,20 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
     }.items():
         require_file(path, label)
 
+    notify(progress, "Building vocals.flac", 68)
     ffmpeg_to_flac(bs_vocals, master / f"01_{track}_vocals.flac")
+    notify(progress, "Building drums.flac", 71)
     ffmpeg_to_flac(bs_drums, master / f"02_{track}_drums.flac")
+    notify(progress, "Building bass.flac", 74)
     shutil.copy2(dem_stems / "bass.flac", master / f"03_{track}_bass.flac")
+    notify(progress, "Building guitar.flac", 77)
     ffmpeg_to_flac(bs_guitar, master / f"04_{track}_guitar.flac")
+    notify(progress, "Building piano_keys.flac", 80)
     ffmpeg_to_flac(bs_piano, master / f"05_{track}_piano_keys.flac")
+    notify(progress, "Building synth_strings_other.flac", 83)
     ffmpeg_to_flac(bs_other, master / f"06_{track}_synth_strings_other.flac")
 
+    notify(progress, "Building clean instrumental.flac", 86)
     run([
         "ffmpeg", "-y",
         "-i", dem_stems / "bass.flac",
@@ -143,10 +165,11 @@ def build_master_pack(input_audio: Path, work_root: Path, model_dir: Path, outpu
         master / f"07_{track}_instrumental_clean.flac",
     ])
 
+    notify(progress, "Writing README", 87)
     write_litelabs_readme(master / "README.txt", track)
 
     archive = output_root / f"{track}-litelabs-stem-pack.zip"
-    make_zip_archive(master, archive, master.name)
+    make_zip_archive(master, archive, master.name, progress)
 
     return {
         "track": track,
