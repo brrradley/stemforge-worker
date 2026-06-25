@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 import requests
 import runpod
 
-print("LiteLABS worker booting", flush=True)
+print("LiteLABS research worker booting", flush=True)
 
 
 def post_progress(url: str | None, token: str | None, job_id: str | int | None, message: str, percent: int) -> None:
@@ -55,29 +55,24 @@ def upload_file_put(url: str, file_path: Path) -> None:
     response.raise_for_status()
 
 
+def infer_filename(url: str, fallback: str) -> str:
+    parsed_name = Path(urlparse(url).path).name
+    return parsed_name or fallback
+
+
 def handler(job: dict) -> dict:
-    print("LiteLABS received job", flush=True)
+    print("LiteLABS research job received", flush=True)
     payload = job.get("input") or {}
 
     if payload.get("healthcheck") is True:
-        return {"ok": True, "status": "ready", "service": "litelabs-worker"}
+        return {
+            "ok": True,
+            "status": "ready",
+            "service": "litelabs-research-worker",
+            "modes": ["master_pack", "vocal_residual_test"],
+        }
 
-    audio_url = payload.get("audio_url")
-    if not audio_url:
-        return {"ok": False, "error": "Missing required input.audio_url"}
-
-    from master_pack import build_master_pack
-
-    filename = payload.get("filename")
-    if not filename:
-        parsed_name = Path(urlparse(audio_url).path).name
-        filename = parsed_name or "track.mp3"
-
-    model_dir = Path(
-        payload.get("model_dir")
-        or os.getenv("STEMFORGE_MODEL_DIR", "/models/bs_roformer_sw")
-    )
-
+    mode = payload.get("mode") or "master_pack"
     result_put_url = payload.get("result_put_url")
     result_public_url = payload.get("result_public_url")
     progress_url = payload.get("progress_url")
@@ -88,11 +83,73 @@ def handler(job: dict) -> dict:
         post_progress(progress_url, progress_token, progress_job_id, message, percent)
 
     try:
-        with tempfile.TemporaryDirectory(prefix="litelabs_") as temp_dir:
+        with tempfile.TemporaryDirectory(prefix="litelabs_research_") as temp_dir:
             temp_root = Path(temp_dir)
+            output_root = temp_root / "output"
+            output_root.mkdir(parents=True, exist_ok=True)
+
+            if mode == "vocal_residual_test":
+                vocals_url = payload.get("vocals_url") or payload.get("audio_url")
+                lead_vocals_url = payload.get("lead_vocals_url") or payload.get("lead_url")
+                if not vocals_url:
+                    return {"ok": False, "error": "Missing input.vocals_url or input.audio_url"}
+                if not lead_vocals_url:
+                    return {"ok": False, "error": "Missing input.lead_vocals_url"}
+
+                filename = payload.get("filename") or infer_filename(vocals_url, "vocals.flac")
+                vocals_path = temp_root / filename
+                lead_path = temp_root / (payload.get("lead_filename") or infer_filename(lead_vocals_url, "lead-vocals.flac"))
+
+                progress("Downloading full vocal stem", 10)
+                download_file(vocals_url, vocals_path)
+                progress("Downloading lead vocal stem", 20)
+                download_file(lead_vocals_url, lead_path)
+
+                from research_tools import build_vocal_residual_test
+
+                progress("Creating backing vocal residual", 45)
+                result = build_vocal_residual_test(
+                    vocals_path=vocals_path,
+                    lead_path=lead_path,
+                    output_root=output_root,
+                    filename=filename,
+                )
+                archive_path = Path(result["archive_path"])
+                archive_size = archive_path.stat().st_size
+
+                uploaded = False
+                if result_put_url:
+                    progress("Uploading research ZIP", 90)
+                    upload_file_put(result_put_url, archive_path)
+                    uploaded = True
+
+                progress("Research pack ready", 100)
+                return {
+                    "ok": True,
+                    "mode": mode,
+                    "track": result["track"],
+                    "archive_size_bytes": archive_size,
+                    "uploaded": uploaded,
+                    "result_url": result_public_url,
+                    "files": result["files"],
+                }
+
+            if mode != "master_pack":
+                return {"ok": False, "error": f"Unknown research mode: {mode}"}
+
+            audio_url = payload.get("audio_url")
+            if not audio_url:
+                return {"ok": False, "error": "Missing required input.audio_url"}
+
+            from master_pack import build_master_pack
+
+            filename = payload.get("filename") or infer_filename(audio_url, "track.mp3")
             input_path = temp_root / filename
             work_root = temp_root / "work"
-            output_root = temp_root / "output"
+            model_dir = Path(
+                payload.get("model_dir")
+                or os.getenv("STEMFORGE_MODEL_DIR", "/models/bs_roformer_sw")
+            )
 
             progress("Worker starting", 12)
             progress("Downloading audio", 15)
@@ -119,6 +176,7 @@ def handler(job: dict) -> dict:
 
             return {
                 "ok": True,
+                "mode": mode,
                 "track": result["track"],
                 "archive_size_bytes": archive_size,
                 "uploaded": uploaded,
@@ -129,10 +187,11 @@ def handler(job: dict) -> dict:
         post_progress(progress_url, progress_token, progress_job_id, f"Worker error: {exc}", 100)
         return {
             "ok": False,
+            "mode": mode,
             "error": str(exc),
             "error_type": exc.__class__.__name__,
         }
 
 
-print("LiteLABS handler ready", flush=True)
+print("LiteLABS research handler ready", flush=True)
 runpod.serverless.start({"handler": handler})
