@@ -73,6 +73,10 @@ def handler(job: dict) -> dict:
         parsed_name = Path(urlparse(audio_url).path).name
         filename = parsed_name or "track.mp3"
 
+    output_format = str(payload.get("output_format") or "flac").lower().strip()
+    if output_format not in {"mp3", "flac"}:
+        output_format = "flac"
+
     model_dir = Path(
         payload.get("model_dir")
         or os.getenv("STEMFORGE_MODEL_DIR", "/models/bs_roformer_sw")
@@ -105,6 +109,7 @@ def handler(job: dict) -> dict:
                 model_dir=model_dir,
                 output_root=output_root,
                 progress=progress,
+                output_format=output_format,
             )
 
             archive_path = Path(result["archive_path"])
@@ -120,6 +125,7 @@ def handler(job: dict) -> dict:
             return {
                 "ok": True,
                 "track": result["track"],
+                "output_format": result.get("output_format", output_format),
                 "archive_size_bytes": archive_size,
                 "uploaded": uploaded,
                 "result_url": result_public_url,
