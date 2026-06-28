@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
+import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -69,33 +71,14 @@ def patch_genre_routing() -> None:
     def tuned_optional_stem_decision(label: str, source: Path):
         decision = original_optional(label, source)
         if label == "Guitar" and decision.include and decision.score < 0.68:
-            return master_pack.StemDecision(
-                decision.label,
-                decision.source,
-                False,
-                "low-confidence guitar/sample bleed",
-                decision.score,
-                decision.active_ratio,
-                decision.mean_db,
-                decision.max_db,
-            )
+            return master_pack.StemDecision(decision.label, decision.source, False, "low-confidence guitar/sample bleed", decision.score, decision.active_ratio, decision.mean_db, decision.max_db)
         if label == "Piano / Keys" and decision.include and decision.score < 0.60:
-            return master_pack.StemDecision(
-                decision.label,
-                decision.source,
-                False,
-                "low-confidence keys/bleed",
-                decision.score,
-                decision.active_ratio,
-                decision.mean_db,
-                decision.max_db,
-            )
+            return master_pack.StemDecision(decision.label, decision.source, False, "low-confidence keys/bleed", decision.score, decision.active_ratio, decision.mean_db, decision.max_db)
         return decision
 
     def tuned_detect_genre_from_audio(decisions: list, core_stats: dict, original_stats: dict) -> tuple[str, str]:
         included = {d.label for d in decisions if d.include}
         optional_scores = {d.label: d.score for d in decisions}
-
         vocals = master_pack.score_of(core_stats, "Vocals")
         drums = master_pack.score_of(core_stats, "Drums")
         bass = master_pack.score_of(core_stats, "Bass")
@@ -103,7 +86,6 @@ def patch_genre_routing() -> None:
         piano = optional_scores.get("Piano / Keys", 0.0)
         synth_other = optional_scores.get("Synths / Strings / Other", 0.0)
         original_active = float(original_stats.get("active_ratio", 0.0))
-
         strong_rhythm = drums >= 0.44 and bass >= 0.30
         strong_vocal = vocals >= 0.45
         strong_guitar = "Guitar" in included and guitar >= 0.42
@@ -111,7 +93,6 @@ def patch_genre_routing() -> None:
         strong_piano = "Piano / Keys" in included and piano >= 0.42
         strong_synth = "Synths / Strings / Other" in included and synth_other >= 0.38
         dance_like = strong_rhythm and (strong_synth or not dominant_guitar or bass >= 0.42)
-
         if dance_like:
             details = ["strong drums/bass"]
             if strong_synth:
@@ -137,6 +118,112 @@ def patch_genre_routing() -> None:
     print("LiteLABS genre routing patch applied", flush=True)
 
 
+def analyse_source_features(path: Path) -> dict:
+    try:
+        import librosa
+        import numpy as np
+        y, sr = librosa.load(path, sr=22050, mono=True, duration=180)
+        if y.size < sr:
+            return {}
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+        tempo_value = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size else 0.0
+        harmonic, percussive = librosa.effects.hpss(y)
+        harmonic_rms = float(np.mean(librosa.feature.rms(y=harmonic)))
+        percussive_rms = float(np.mean(librosa.feature.rms(y=percussive)))
+        percussive_ratio = percussive_rms / (harmonic_rms + percussive_rms + 1e-9)
+        spectrum = np.abs(librosa.stft(y, n_fft=2048))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
+        total = float(spectrum.sum()) + 1e-9
+        bass_mask = (freqs >= 55) & (freqs < 250)
+        return {
+            "tempo": round(tempo_value, 2),
+            "beat_count": int(len(beats)),
+            "percussive_ratio": round(float(percussive_ratio), 3),
+            "bass_ratio": round(float(spectrum[bass_mask].sum() / total), 3),
+        }
+    except Exception as exc:
+        print(f"LiteLABS source feature analysis skipped: {exc}", flush=True)
+        return {}
+
+
+def source_genre_override(features: dict) -> tuple[str | None, str | None]:
+    tempo = float(features.get("tempo", 0.0) or 0.0)
+    percussive = float(features.get("percussive_ratio", 0.0) or 0.0)
+    bass = float(features.get("bass_ratio", 0.0) or 0.0)
+    dance_tempo = 118.0 <= tempo <= 136.0
+    if (dance_tempo and percussive >= 0.42) or (percussive >= 0.52 and bass >= 0.12):
+        reason = f"source audio has dance-like rhythm profile"
+        if tempo:
+            reason += f" ({tempo:.0f} BPM, percussive {percussive:.2f})"
+        return "electronic_dance", reason
+    if percussive < 0.28 and bass < 0.13:
+        return None, "sparse source profile"
+    return None, None
+
+
+def rebuild_archive(root: Path, archive_path: Path) -> None:
+    if archive_path.exists():
+        archive_path.unlink()
+    with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_STORED) as zip_file:
+        for path in sorted(root.rglob("*")):
+            if path.is_file():
+                zip_file.write(path, arcname=str(path.relative_to(root)))
+
+
+def post_process_archive(archive_path: Path, source_features: dict) -> list[str]:
+    import master_pack
+
+    changes: list[str] = []
+    genre_override, genre_reason = source_genre_override(source_features)
+    with tempfile.TemporaryDirectory(prefix="litelabs_post_") as post_dir:
+        root = Path(post_dir)
+        with zipfile.ZipFile(archive_path, "r") as zip_file:
+            zip_file.extractall(root)
+        files = [p for p in root.rglob("*") if p.is_file()]
+        readme = next((p for p in files if p.name == "README.txt"), None)
+
+        omitted_notes: list[str] = []
+        sparse_hint = genre_reason == "sparse source profile"
+        for stem_file in list(files):
+            lower = stem_file.name.lower()
+            label = None
+            threshold = 0.0
+            if "_drums." in lower:
+                label, threshold = "Drums", 0.30 if sparse_hint else 0.22
+            elif "_bass." in lower:
+                label, threshold = "Bass", 0.28 if sparse_hint else 0.20
+            elif "_guitar." in lower:
+                label, threshold = "Guitar", 0.32
+            elif "_piano_keys." in lower:
+                label, threshold = "Piano / Keys", 0.30
+            if not label:
+                continue
+            stats = master_pack.analyse_audio(stem_file)
+            score = float(stats.get("score", 0.0))
+            active = float(stats.get("active_ratio", 0.0))
+            if score < threshold or active < 0.06:
+                stem_file.unlink(missing_ok=True)
+                omitted_notes.append(f"{label} — low activity / not useful enough for this pack")
+                changes.append(f"removed {label}")
+
+        if readme and readme.exists():
+            text = readme.read_text(encoding="utf-8", errors="replace")
+            if genre_override:
+                text = re.sub(r"Detected genre: .+", f"Detected genre: {genre_override}", text)
+                text = re.sub(r"Genre reason: .+", f"Genre reason: {genre_reason}", text)
+                changes.append(f"genre set to {genre_override}")
+            if omitted_notes:
+                if "Omitted stems:" in text:
+                    text = text.replace("\n\nGenerated with care", "\n" + "\n".join(omitted_notes) + "\n\nGenerated with care")
+                else:
+                    text = text.replace("\n\nGenerated with care", "\n\nOmitted stems:\n\n" + "\n".join(omitted_notes) + "\n\nGenerated with care")
+            readme.write_text(text, encoding="utf-8")
+            changes.append("README updated")
+        if changes:
+            rebuild_archive(root, archive_path)
+    return changes
+
+
 def handler(job: dict) -> dict:
     print("LiteLABS received job", flush=True)
     payload = job.get("input") or {}
@@ -160,11 +247,7 @@ def handler(job: dict) -> dict:
     if output_format not in {"mp3", "flac"}:
         output_format = "flac"
 
-    model_dir = Path(
-        payload.get("model_dir")
-        or os.getenv("STEMFORGE_MODEL_DIR", "/models/bs_roformer_sw")
-    )
-
+    model_dir = Path(payload.get("model_dir") or os.getenv("STEMFORGE_MODEL_DIR", "/models/bs_roformer_sw"))
     result_put_url = payload.get("result_put_url")
     result_public_url = payload.get("result_public_url")
     progress_url = payload.get("progress_url")
@@ -185,19 +268,18 @@ def handler(job: dict) -> dict:
             progress("Downloading audio", 15)
             download_file(audio_url, input_path)
             progress("Audio downloaded", 17)
+            source_features = analyse_source_features(input_path)
+            print(f"LiteLABS source features: {source_features}", flush=True)
 
-            result = build_master_pack(
-                input_audio=input_path,
-                work_root=work_root,
-                model_dir=model_dir,
-                output_root=output_root,
-                progress=progress,
-                output_format=output_format,
-            )
-
+            result = build_master_pack(input_audio=input_path, work_root=work_root, model_dir=model_dir, output_root=output_root, progress=progress, output_format=output_format)
             archive_path = Path(result["archive_path"])
-            archive_size = archive_path.stat().st_size
 
+            progress("Validating final stem pack", 93)
+            post_changes = post_process_archive(archive_path, source_features)
+            if post_changes:
+                print(f"LiteLABS post-process changes: {post_changes}", flush=True)
+
+            archive_size = archive_path.stat().st_size
             uploaded = False
             if result_put_url:
                 progress("Uploading ZIP back to LiteRECORDS", 94)
@@ -213,14 +295,12 @@ def handler(job: dict) -> dict:
                 "uploaded": uploaded,
                 "result_url": result_public_url,
                 "stems": result["stems"],
+                "post_process_changes": post_changes,
+                "source_features": source_features,
             }
     except Exception as exc:
         post_progress(progress_url, progress_token, progress_job_id, f"Worker error: {exc}", 100)
-        return {
-            "ok": False,
-            "error": str(exc),
-            "error_type": exc.__class__.__name__,
-        }
+        return {"ok": False, "error": str(exc), "error_type": exc.__class__.__name__}
 
 
 print("LiteLABS handler ready", flush=True)
