@@ -10,6 +10,8 @@ import runpod
 
 print("LiteLABS worker booting", flush=True)
 
+_GENRE_PATCHED = False
+
 
 def post_progress(url: str | None, token: str | None, job_id: str | int | None, message: str, percent: int) -> None:
     print(f"LiteLABS progress {percent}%: {message}", flush=True)
@@ -55,6 +57,86 @@ def upload_file_put(url: str, file_path: Path) -> None:
     response.raise_for_status()
 
 
+def patch_genre_routing() -> None:
+    global _GENRE_PATCHED
+    if _GENRE_PATCHED:
+        return
+
+    import master_pack
+
+    original_optional = master_pack.optional_stem_decision
+
+    def tuned_optional_stem_decision(label: str, source: Path):
+        decision = original_optional(label, source)
+        if label == "Guitar" and decision.include and decision.score < 0.68:
+            return master_pack.StemDecision(
+                decision.label,
+                decision.source,
+                False,
+                "low-confidence guitar/sample bleed",
+                decision.score,
+                decision.active_ratio,
+                decision.mean_db,
+                decision.max_db,
+            )
+        if label == "Piano / Keys" and decision.include and decision.score < 0.60:
+            return master_pack.StemDecision(
+                decision.label,
+                decision.source,
+                False,
+                "low-confidence keys/bleed",
+                decision.score,
+                decision.active_ratio,
+                decision.mean_db,
+                decision.max_db,
+            )
+        return decision
+
+    def tuned_detect_genre_from_audio(decisions: list, core_stats: dict, original_stats: dict) -> tuple[str, str]:
+        included = {d.label for d in decisions if d.include}
+        optional_scores = {d.label: d.score for d in decisions}
+
+        vocals = master_pack.score_of(core_stats, "Vocals")
+        drums = master_pack.score_of(core_stats, "Drums")
+        bass = master_pack.score_of(core_stats, "Bass")
+        guitar = optional_scores.get("Guitar", 0.0)
+        piano = optional_scores.get("Piano / Keys", 0.0)
+        synth_other = optional_scores.get("Synths / Strings / Other", 0.0)
+        original_active = float(original_stats.get("active_ratio", 0.0))
+
+        strong_rhythm = drums >= 0.44 and bass >= 0.30
+        strong_vocal = vocals >= 0.45
+        strong_guitar = "Guitar" in included and guitar >= 0.42
+        dominant_guitar = strong_guitar and guitar > max(synth_other + 0.18, 0.66)
+        strong_piano = "Piano / Keys" in included and piano >= 0.42
+        strong_synth = "Synths / Strings / Other" in included and synth_other >= 0.38
+        dance_like = strong_rhythm and (strong_synth or not dominant_guitar or bass >= 0.42)
+
+        if dance_like:
+            details = ["strong drums/bass"]
+            if strong_synth:
+                details.append("active synth/other")
+            if strong_guitar and not dominant_guitar:
+                details.append("guitar appears secondary/sample-like")
+            return "electronic_dance", ", ".join(details)
+        if strong_rhythm and dominant_guitar:
+            return "rock_band", "strong drums with dominant confident guitar activity"
+        if strong_piano and strong_vocal and drums < 0.42:
+            return "piano_vocal_or_pop_ballad", "confident piano/keys with strong vocal and lighter drums"
+        if strong_vocal and drums >= 0.35 and bass >= 0.25 and not dominant_guitar:
+            return "vocal_pop", "strong vocal with moderate rhythm section and no dominant guitar"
+        if strong_vocal and original_active > 0.35 and drums < 0.30 and bass < 0.30:
+            return "acoustic_or_sparse", "strong vocal with low drum/bass activity"
+        if strong_rhythm and not strong_vocal:
+            return "instrumental_or_dance", "strong drums/bass with weaker vocal presence"
+        return "mixed_or_unknown", "audio features did not strongly match a known route"
+
+    master_pack.optional_stem_decision = tuned_optional_stem_decision
+    master_pack.detect_genre_from_audio = tuned_detect_genre_from_audio
+    _GENRE_PATCHED = True
+    print("LiteLABS genre routing patch applied", flush=True)
+
+
 def handler(job: dict) -> dict:
     print("LiteLABS received job", flush=True)
     payload = job.get("input") or {}
@@ -66,6 +148,7 @@ def handler(job: dict) -> dict:
     if not audio_url:
         return {"ok": False, "error": "Missing required input.audio_url"}
 
+    patch_genre_routing()
     from master_pack import build_master_pack
 
     filename = payload.get("filename")
