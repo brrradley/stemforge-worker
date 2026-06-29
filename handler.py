@@ -180,11 +180,18 @@ def post_process_archive(archive_path: Path, source_features: dict) -> list[str]
 
         guitar_file = next((p for p in files if "_guitar." in p.name.lower()), None)
         synth_file = next((p for p in files if "_synth_strings_other." in p.name.lower()), None)
+        drums_file = next((p for p in files if "_drums." in p.name.lower()), None)
+        bass_file = next((p for p in files if "_bass." in p.name.lower()), None)
         guitar_stats = master_pack.analyse_audio(guitar_file) if guitar_file else {}
         synth_stats = master_pack.analyse_audio(synth_file) if synth_file else {}
+        drums_stats = master_pack.analyse_audio(drums_file) if drums_file else {}
+        bass_stats = master_pack.analyse_audio(bass_file) if bass_file else {}
         guitar_score = float(guitar_stats.get("score", 0.0))
         synth_score = float(synth_stats.get("score", 0.0))
-        protect_rock = current_genre == "rock_band" and guitar_score >= max(synth_score + 0.18, 0.68)
+        drums_score = float(drums_stats.get("score", 0.0))
+        bass_score = float(bass_stats.get("score", 0.0))
+        dominant_rock_guitar = guitar_score >= max(synth_score + 0.18, 0.66) and drums_score >= 0.44 and bass_score >= 0.30
+        protect_rock = current_genre == "rock_band" and dominant_rock_guitar
 
         omitted_notes: list[str] = []
         sparse_hint = genre_reason == "sparse source profile"
@@ -212,7 +219,11 @@ def post_process_archive(archive_path: Path, source_features: dict) -> list[str]
 
         if readme and readme.exists():
             text = readme.read_text(encoding="utf-8", errors="replace")
-            if genre_override and not protect_rock:
+            if dominant_rock_guitar:
+                text = re.sub(r"Detected genre: .+", "Detected genre: rock_band", text)
+                text = re.sub(r"Genre reason: .+", "Genre reason: dominant guitar, drums and bass indicate rock band", text)
+                changes.append("genre set to rock_band")
+            elif genre_override and not protect_rock:
                 text = re.sub(r"Detected genre: .+", f"Detected genre: {genre_override}", text)
                 text = re.sub(r"Genre reason: .+", f"Genre reason: {genre_reason}", text)
                 changes.append(f"genre set to {genre_override}")
