@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -13,6 +14,10 @@ import runpod
 print("LiteLABS worker booting", flush=True)
 
 _GENRE_PATCHED = False
+
+
+def is_enabled(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
 def post_progress(url: str | None, token: str | None, job_id: str | int | None, message: str, percent: int) -> None:
@@ -165,7 +170,166 @@ def read_detected_genre(readme: Path | None) -> str:
     return match.group(1).strip() if match else ""
 
 
-def post_process_archive(archive_path: Path, source_features: dict) -> list[str]:
+def run_audio_separator(input_file: Path, output_dir: Path, model_filename: str, output_format: str) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    before = {p.resolve() for p in output_dir.rglob("*") if p.is_file()}
+    model_dir = Path(os.getenv("LITELABS_AUDIO_SEPARATOR_MODEL_DIR", "/models/audio_separator"))
+    model_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "audio-separator",
+        str(input_file),
+        "--model_filename", model_filename,
+        "--model_file_dir", str(model_dir),
+        "--output_dir", str(output_dir),
+        "--output_format", output_format.upper(),
+    ]
+    print("LiteLABS extra vocals RUN:", " ".join(cmd), flush=True)
+    completed = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+    print(completed.stdout or "", flush=True)
+    if completed.returncode != 0:
+        raise RuntimeError(f"audio-separator failed for {model_filename}")
+    after = [p for p in output_dir.rglob("*") if p.is_file() and p.resolve() not in before]
+    return sorted(after, key=lambda p: p.stat().st_size, reverse=True)
+
+
+def classify_extra_vocal_outputs(files: list[Path]) -> dict[str, Path]:
+    classified: dict[str, Path] = {}
+    for file in files:
+        lower = file.name.lower()
+        if any(token in lower for token in ["backing", "backing_only", "back_vocal", "bv_vocal", "_bv", "-bv"]):
+            classified.setdefault("backing", file)
+        elif any(token in lower for token in ["lead", "lead_only", "main_vocal", "main vocals"]):
+            classified.setdefault("lead", file)
+        elif any(token in lower for token in ["dry", "dereverb", "deverb", "no_reverb", "noreverb", "no-reverb"]):
+            classified.setdefault("dry", file)
+        elif "reverb" in lower or "echo" in lower:
+            continue
+        elif "vocals" in lower or "vocal" in lower:
+            classified.setdefault("dry", file)
+    return classified
+
+
+def is_useful_extra_vocal(path: Path, min_score: float, min_active: float) -> tuple[bool, str]:
+    import master_pack
+
+    stats = master_pack.analyse_audio(path)
+    score = float(stats.get("score", 0.0))
+    active = float(stats.get("active_ratio", 0.0))
+    max_db = float(stats.get("max_db", -99.0))
+    if max_db <= -45.0:
+        return False, "too quiet / not confidently detected"
+    if active < min_active:
+        return False, "low activity"
+    if score < min_score:
+        return False, "low confidence / likely artefacts"
+    return True, "useful"
+
+
+def next_stem_index(files: list[Path]) -> int:
+    indexes: list[int] = []
+    for file in files:
+        match = re.match(r"^(\d+)_", file.name)
+        if match:
+            indexes.append(int(match.group(1)))
+    return (max(indexes) + 1) if indexes else 1
+
+
+def append_readme_notes(readme: Path | None, included_notes: list[str], omitted_notes: list[str]) -> None:
+    if not readme or not readme.exists():
+        return
+    text = readme.read_text(encoding="utf-8", errors="replace")
+    if included_notes:
+        insert = "\n" + "\n".join(included_notes)
+        if "\n\nOmitted stems:" in text:
+            text = text.replace("\n\nOmitted stems:", insert + "\n\nOmitted stems:", 1)
+        else:
+            text = text.replace("\n\nGenerated with care", insert + "\n\nGenerated with care", 1)
+    if omitted_notes:
+        if "Omitted stems:" in text:
+            text = text.replace("\n\nGenerated with care", "\n" + "\n".join(omitted_notes) + "\n\nGenerated with care", 1)
+        else:
+            text = text.replace("\n\nGenerated with care", "\n\nOmitted stems:\n\n" + "\n".join(omitted_notes) + "\n\nGenerated with care", 1)
+    readme.write_text(text, encoding="utf-8")
+
+
+def add_extra_vocals(root: Path, files: list[Path], readme: Path | None, output_format: str) -> list[str]:
+    import master_pack
+
+    if not is_enabled(os.getenv("LITELABS_EXTRA_VOCALS")):
+        return []
+
+    changes: list[str] = []
+    included_notes: list[str] = []
+    omitted_notes: list[str] = []
+    master_dir = readme.parent if readme else next((p.parent for p in files if re.match(r"^\d+_", p.name)), root)
+    vocal_file = next((p for p in files if "_vocals." in p.name.lower() and "lead" not in p.name.lower() and "backing" not in p.name.lower()), None)
+    if not vocal_file or not vocal_file.exists():
+        return []
+
+    model_backing = os.getenv("LITELABS_BACKING_MODEL", "UVR-BVE-4B_SN-44100-1.pth")
+    model_dry = os.getenv("LITELABS_DRY_MODEL", "deverb_bs_roformer_8_256dim_8depth.ckpt")
+    temp_root = root / "__litelabs_extra_vocals"
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    output_index = next_stem_index([p for p in master_dir.iterdir() if p.is_file()])
+
+    try:
+        backing_outputs = run_audio_separator(vocal_file, temp_root / "backing", model_backing, output_format)
+        classified = classify_extra_vocal_outputs(backing_outputs)
+        lead_candidate = classified.get("lead")
+        backing_candidate = classified.get("backing")
+
+        if lead_candidate and lead_candidate.exists():
+            useful, reason = is_useful_extra_vocal(lead_candidate, 0.28, 0.08)
+            if useful:
+                dest = master_dir / f"{output_index:02d}_{vocal_file.stem.replace('_vocals', '')}_lead_vocals.{output_format}"
+                master_pack.copy_or_convert_audio(lead_candidate, dest, output_format)
+                included_notes.append(f"{output_index:02d} Lead Vocals")
+                changes.append("added Lead Vocals")
+                output_index += 1
+            else:
+                omitted_notes.append(f"Lead Vocals — {reason}")
+
+        if backing_candidate and backing_candidate.exists():
+            useful, reason = is_useful_extra_vocal(backing_candidate, 0.24, 0.04)
+            if useful:
+                dest = master_dir / f"{output_index:02d}_{vocal_file.stem.replace('_vocals', '')}_backing_vocals.{output_format}"
+                master_pack.copy_or_convert_audio(backing_candidate, dest, output_format)
+                included_notes.append(f"{output_index:02d} Backing Vocals")
+                changes.append("added Backing Vocals")
+                output_index += 1
+            else:
+                omitted_notes.append(f"Backing Vocals — {reason}")
+        else:
+            omitted_notes.append("Backing Vocals — model did not produce a confident backing vocal file")
+
+        dry_source = lead_candidate if lead_candidate and lead_candidate.exists() else vocal_file
+        dry_outputs = run_audio_separator(dry_source, temp_root / "dry", model_dry, output_format)
+        dry_candidate = classify_extra_vocal_outputs(dry_outputs).get("dry") or (dry_outputs[0] if dry_outputs else None)
+        if dry_candidate and dry_candidate.exists():
+            useful, reason = is_useful_extra_vocal(dry_candidate, 0.28, 0.08)
+            if useful:
+                dest = master_dir / f"{output_index:02d}_{vocal_file.stem.replace('_vocals', '')}_lead_vocals_dry.{output_format}"
+                master_pack.copy_or_convert_audio(dry_candidate, dest, output_format)
+                included_notes.append(f"{output_index:02d} Lead Vocals Dry")
+                changes.append("added Lead Vocals Dry")
+                output_index += 1
+            else:
+                omitted_notes.append(f"Lead Vocals Dry — {reason}")
+        else:
+            omitted_notes.append("Lead Vocals Dry — dereverb model did not produce a confident dry vocal file")
+    except Exception as exc:
+        print(f"LiteLABS extra vocal pass skipped: {exc}", flush=True)
+        omitted_notes.append("Extra vocal stems — experimental local vocal pass failed for this track")
+        changes.append("extra vocal pass skipped")
+
+    append_readme_notes(readme, included_notes, omitted_notes)
+    if included_notes or omitted_notes:
+        changes.append("extra vocal README notes updated")
+    return changes
+
+
+def post_process_archive(archive_path: Path, source_features: dict, output_format: str = "flac") -> list[str]:
     import master_pack
 
     changes: list[str] = []
@@ -237,6 +401,11 @@ def post_process_archive(archive_path: Path, source_features: dict) -> list[str]
                     text = text.replace("\n\nGenerated with care", "\n\nOmitted stems:\n\n" + "\n".join(omitted_notes) + "\n\nGenerated with care")
             readme.write_text(text, encoding="utf-8")
             changes.append("README updated")
+
+        files = [p for p in root.rglob("*") if p.is_file()]
+        extra_changes = add_extra_vocals(root, files, readme, output_format)
+        changes.extend(extra_changes)
+
         if changes:
             rebuild_archive(root, archive_path)
     return changes
@@ -293,7 +462,7 @@ def handler(job: dict) -> dict:
             archive_path = Path(result["archive_path"])
 
             progress("Validating final stem pack", 93)
-            post_changes = post_process_archive(archive_path, source_features)
+            post_changes = post_process_archive(archive_path, source_features, output_format)
             if post_changes:
                 print(f"LiteLABS post-process changes: {post_changes}", flush=True)
 
