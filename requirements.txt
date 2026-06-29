@@ -2,3 +2,5 @@ runpod
 requests
 bs-roformer-infer
 demucs
+librosa
+audio-separator==0.44.2
