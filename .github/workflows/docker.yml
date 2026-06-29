@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - research
   workflow_dispatch:
 
 permissions:
