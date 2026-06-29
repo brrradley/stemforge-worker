@@ -20,12 +20,8 @@ text = text.replace(
     '    if (dance_tempo and percussive >= 0.48 and bass >= 0.13) or (percussive >= 0.62 and bass >= 0.15):',
     '    rap_tempo = 75.0 <= tempo <= 115.0\n    if rap_tempo and 0.32 <= percussive <= 0.58 and bass >= 0.13:\n        reason = "source audio has rap/hip-hop-like rhythm profile"\n        if tempo:\n            reason += f" ({tempo:.0f} BPM, percussive {percussive:.2f})"\n        return "hip_hop_rap", reason\n    if (dance_tempo and percussive >= 0.48 and bass >= 0.13) or (percussive >= 0.62 and bass >= 0.15):',
 )
-text = text.replace(
-    '        elif any(token in lower for token in ["dry", "dereverb", "deverb", "no_reverb", "noreverb", "no-reverb"]):\n            classified.setdefault("dry", file)\n        elif "reverb" in lower or "echo" in lower:',
-    '        normalised = lower.replace("_", " ").replace("-", " ")\n        elif any(token in normalised for token in ["dry", "dereverb", "deverb", "no reverb", "no echo", "noreverb"]):\n            classified.setdefault("dry", file)\n        elif "reverb" in normalised or "echo" in normalised:',
-)
-insert_after = '''def classify_extra_vocal_outputs(files: list[Path]) -> dict[str, Path]:\n    classified: dict[str, Path] = {}\n    for file in files:\n        lower = file.name.lower()'''
-# If the replacement above created invalid code because normalised was inserted after elif, fix by replacing the whole function.
+
+# Replace the classifier and add dry-vocal validation helpers.
 start = text.find('def classify_extra_vocal_outputs(files: list[Path]) -> dict[str, Path]:')
 end = text.find('\ndef is_useful_extra_vocal', start)
 if start != -1 and end != -1:
@@ -65,6 +61,31 @@ def pick_dry_vocal_output(files: list[Path]) -> Path | None:
     ordered = sorted(files, key=rank)
     return ordered[0] if rank(ordered[0])[0] < 9 else None
 
+
+def is_valid_dry_main_vocal(source: Path, dry: Path) -> tuple[bool, str]:
+    try:
+        import librosa
+        import numpy as np
+        src, sr = librosa.load(source, sr=22050, mono=True)
+        out, _ = librosa.load(dry, sr=22050, mono=True)
+        size = min(src.size, out.size)
+        if size < sr:
+            return False, "too short to validate"
+        src = src[:size]
+        out = out[:size]
+        src_rms = float(np.sqrt(np.mean(src ** 2)) + 1e-9)
+        out_rms = float(np.sqrt(np.mean(out ** 2)) + 1e-9)
+        ratio = out_rms / src_rms
+        corr = float(np.corrcoef(src, out)[0, 1]) if size > 2 else 0.0
+        if ratio < 0.45:
+            return False, "looked like residual/reverb rather than main vocal"
+        if corr < 0.55:
+            return False, "too different from main vocal / likely residual"
+        return True, "validated"
+    except Exception as exc:
+        print(f"LiteLABS dry validation skipped: {exc}", flush=True)
+        return True, "validation skipped"
+
 ''' + text[end+1:]
 
 block_start = text.find('    try:\n        backing_outputs = run_audio_separator(vocal_file, temp_root / "backing", model_backing, output_format)')
@@ -72,7 +93,7 @@ block_end = text.find('    append_readme_notes(readme, included_notes, omitted_n
 if block_start == -1 or block_end == -1:
     raise SystemExit('extra vocal block not found')
 new_block = '''    try:
-        backing_args = ["--vr_aggression", os.getenv("LITELABS_BACKING_VR_AGGRESSION", "10"), "--vr_enable_post_process", "--vr_post_process_threshold", os.getenv("LITELABS_BACKING_POST_THRESHOLD", "0.12")]
+        backing_args = ["--vr_aggression", os.getenv("LITELABS_BACKING_VR_AGGRESSION", "14"), "--vr_enable_post_process", "--vr_post_process_threshold", os.getenv("LITELABS_BACKING_POST_THRESHOLD", "0.10")]
         backing_outputs = run_audio_separator(vocal_file, temp_root / "backing", model_backing, output_format, backing_args)
         backing_candidate = next((p for p in backing_outputs if "(vocals)" in p.name.lower()), None)
         if not backing_candidate:
@@ -99,15 +120,16 @@ new_block = '''    try:
         dry_outputs = run_audio_separator(vocal_file, temp_root / "dry", model_dry, output_format)
         dry_candidate = pick_dry_vocal_output(dry_outputs)
         if dry_candidate and dry_candidate.exists():
+            valid_dry, dry_reason = is_valid_dry_main_vocal(vocal_file, dry_candidate)
             useful, reason = is_useful_extra_vocal(dry_candidate, 0.24, 0.06)
-            if useful:
+            if useful and valid_dry:
                 dest = master_dir / f"{output_index:02d}_{vocal_file.stem.replace('_vocals', '')}_dry_main_vocals.{output_format}"
                 master_pack.copy_or_convert_audio(dry_candidate, dest, output_format)
                 included_notes.append(f"{output_index:02d} Dry Main Vocals")
                 changes.append("added Dry Main Vocals")
                 output_index += 1
             else:
-                omitted_notes.append(f"Dry Main Vocals — {reason}")
+                omitted_notes.append(f"Dry Main Vocals — {dry_reason if not valid_dry else reason}")
         else:
             omitted_notes.append("Dry Main Vocals — dereverb model did not produce a dry vocal file")
     except Exception as exc:
