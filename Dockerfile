@@ -12,7 +12,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 RUN python -m pip install --upgrade pip setuptools wheel
-RUN python -m pip install audio-separator==0.44.2 onnxruntime-gpu
+RUN python -m pip install audio-separator==0.44.2 onnxruntime-gpu==1.22.0
 RUN mkdir -p /models/audio_separator
 
 CMD ["python", "-u", "/app/handler.py"]
